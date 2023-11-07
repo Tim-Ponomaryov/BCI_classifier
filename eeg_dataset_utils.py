@@ -7,26 +7,28 @@ from random import shuffle
 
 import torch
 from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
+# from torch.utils.data import DataLoader
 from torch import nn as nn 
 import torchvision.transforms.functional as F
-from torchvision.transforms import Compose
+# from torchvision.transforms import Compose
 
-from sklearn.model_selection import StratifiedKFold
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
-from sklearn.svm import SVC, LinearSVC
-from sklearn.metrics import balanced_accuracy_score, f1_score, accuracy_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_validate
+# from sklearn.model_selection import StratifiedKFold
+# from sklearn.model_selection import train_test_split
+# from sklearn.preprocessing import RobustScaler
+# from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+# from sklearn.svm import SVC, LinearSVC
+# from sklearn.metrics import balanced_accuracy_score, f1_score, accuracy_score
+# from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_validate
 
 from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
 
 class EEGDataset(Dataset):
     '''Simple dataset for P300 eeg data for one subject'''
     
     def __init__(self, root_dir:str=None, subject:str=None, data:np.ndarray=None, labels:np.ndarray=None,
-                 transform=None, pick_channels=None):
+                 info:pd.DataFrame=None, transform=None, pick_channels=None):
         
         super().__init__()
         
@@ -37,7 +39,10 @@ class EEGDataset(Dataset):
         
         if isinstance(data, np.ndarray) and isinstance(labels, np.ndarray):
             self.data = data
+            self.x = data.copy()
             self.labels = labels
+            self.y = labels.copy()
+            self.info = info
         else:
             self.load_data()
             
@@ -71,6 +76,8 @@ class EEGDataset(Dataset):
         self.x = self.data.copy()
         self.labels = np.load(os.path.join(self.root_dir, f'{self.subject}_c_labels.npy'))
         self.y = self.labels.copy()
+        self.info = pd.read_csv(os.path.join(self.root_dir, 'info', f'{self.subject}_c_events_info.csv'), header=0, index_col=0)
+        self.info.reset_index(inplace=True, names='old_index')
     
     def _channels(self):
         '''Get list of channels (electrodes) in data
@@ -80,7 +87,7 @@ class EEGDataset(Dataset):
         '''
         
         from ast import literal_eval
-        with open('./P300BCI_DataSet/eeg_ch_names.txt', 'r') as f:
+        with open(os.path.join(self.root_dir, 'eeg_ch_names.txt'), 'r') as f:
             self.ch_names = literal_eval(f.readline())
     
     def _subjects(self):
@@ -133,6 +140,7 @@ def merge_datasets(*datasets) -> EEGDataset:
     
     data = np.vstack([d.data for d in datasets])
     labels = np.hstack([d.labels for d in datasets])
+    info = pd.concat([d.info for d in datasets])
     
     return EEGDataset(data=data, labels=labels)
 
@@ -172,6 +180,7 @@ class EEGDatasetAdvanced(Dataset):
         self.load_data(**kwargs) # load data
         if self.subjects != []:
             self.pick_subjects(self.subjects)
+        self.get_info()
         
     def __len__(self):
         
@@ -199,6 +208,7 @@ class EEGDatasetAdvanced(Dataset):
             if self.load_cache:
                 # print('Cache is already available')
                 self.data = os.listdir(self.cache_path)
+                self.data.sort(key=lambda x: (x.split('_')[0], int(x.split('_')[2])))
                 return
             self._load_and_cache(**kwargs)
         else:
@@ -214,7 +224,7 @@ class EEGDatasetAdvanced(Dataset):
             labels = np.load(os.path.join(self.root_dir, f'{name}_c_labels.npy'))
             data = data.astype(dtype)[:,:,::downsample]
             for i in range(data.shape[0]):
-                np.save(os.path.join(self.cache_path, f'{name}_epoch_{i}_class_{labels[i]}_.npy'), data[i,...])
+                np.save(os.path.join(self.cache_path, f'{name}_epoch_{i}_class_{labels[i]}_.npy'), data[i])
         print(f'All data is cached in {self.cache_path}')
         self.data = os.listdir(self.cache_path)
         
@@ -233,6 +243,16 @@ class EEGDatasetAdvanced(Dataset):
         self.available_subjects.sort()
         if self.subjects == []:
             self.subjects = self.available_subjects.copy()
+    
+    def get_info(self):
+        
+        info_list = []
+        for subject in self.subjects:
+            info = pd.read_csv(os.path.join(self.root_dir, 'info', f'{subject}_c_events_info.csv'), header=0, index_col=0)
+            info.reset_index(inplace=True, names='old_index')
+            info_list.append(info)
+        self.info = pd.concat(info_list)
+                
         
     def get_channels(self):
         '''Get list of channels (electrodes) in data
@@ -273,7 +293,10 @@ class EEGDatasetAdvanced(Dataset):
         '''Pick given subjects from a dataset'''
         
         self.data = [file for file in self.data if file.split('_')[0] in subjects]
-        self.picked_subjects = subjects
+        self.subjects = subjects
+        self.subjects.sort()
+        self.data.sort(key=lambda x: (x.split('_')[0], int(x.split('_')[2])))
+        self.get_info()
 
 class Normalize(nn.Module):
     '''Normalization for non-image data
@@ -317,18 +340,45 @@ class Unsqueeze(nn.Module):
 def flatten(array:np.ndarray):
     return array.reshape([array.shape[0], array.shape[1]*array.shape[2]])
 
-
-def my_train_test_split(dataset, size=[], control_subject=False):
+def my_simple_split(dataset:EEGDataset, size:list):
+    '''
+    Splits the EEGDataset into train and test set
+    
+    Arguments
+    dataset -- EEGDataset instance
+    size -- a list len of 2 [train_size, test_size]
+    
+    Returns:
+    tuple of train_set and test_set EEGDatasets
     
     '''
-    Splits the EEGDatasetAdvanced into train and test set
+    
+    assert len(size)==2, 'size must be given as [train_size, test_size] in parts [0.8, 0.2] e.g.'
+    train_size, test_size = size
+    
+    idx_sep = round(len(dataset)*train_size)
+    train_set = EEGDataset(root_dir=dataset.root_dir, 
+                           data=dataset.x[:idx_sep,:,:],
+                           labels=dataset.y[:idx_sep],
+                           info=dataset.info[:idx_sep])
+    test_set = EEGDataset(root_dir=dataset.root_dir,
+                          data=dataset.x[idx_sep:,:,:],
+                          labels=dataset.y[idx_sep:],
+                          info=dataset.info[idx_sep:])
+    
+    return train_set, test_set
+    
+    
+
+def my_train_test_split(dataset:EEGDatasetAdvanced, size=[], control_subject=False):
+    
+    '''Splits the EEGDatasetAdvanced into train and test set
     
     Arguments:
     dataset -- EEGDatasetAdvanced instance
     size -- a list len of 2 [train_size, test_size]
     control_subject -- wether need to manage subjects when splitting
                        the dataset (for a mult-subject dataset e.g.)
-    
     '''
     
     assert len(size)==2, 'size must be given as [train_size, test_size] in parts [0.8, 0.2] e.g.'
@@ -355,6 +405,8 @@ def my_train_test_split(dataset, size=[], control_subject=False):
         
         train_set.data = dataset.data[:idx_sep]
         test_set.data = test_set.data[idx_sep:]
+        train_set.info = dataset.info[:idx_sep]
+        test_set.info = test_set.info[idx_sep:]
         
         return train_set, test_set
     
@@ -386,3 +438,65 @@ class One_vs_all():
         self.index+=1
         
         return train_set, test_set
+
+from collections import Counter
+    
+def sampling(dataset:EEGDataset=None, X:np.ndarray=None, y:np.ndarray=None,
+             report=False, mode:list=None):
+    '''
+    
+    mode -- 'real', 'over', 'under', 'balanced'
+    '''
+    
+    if dataset:
+        X = flatten(dataset.x.copy()) if len(dataset.x.shape)>2 else dataset.x.copy() # to flatten channels dim
+        y = dataset.y.copy()
+    else:
+        X = flatten(X.copy()) if len(X.shape)>2 else X.copy()
+        y = y.copy()
+    count = Counter(y)
+    if report:
+        print(f'x shape: {X.shape}\ny shape: {y.shape}')
+        print(f'class ratio: target={count[0]}, non-target={count[1]}')
+    
+    mode = mode if mode else ['real','over', 'under', 'balanced']
+    
+    data = dict.fromkeys(mode)
+    
+    if 'real' in mode:
+        data['real']={'x':X, 'y':y}
+    
+    # Make downsampling
+    if 'under' in mode:
+        n_target = count[0]
+        y_down = np.hstack([y[y==0], y[y==1][:n_target]])
+        X_down = np.vstack([X[y==0], X[y==1][:n_target]])
+        data['under'] = {'x':X_down, 'y':y_down}
+        count = Counter(y_down)
+        if report:
+            print(f'x downsampled shape: {X_down.shape}\ny downsampled shape: {y_down.shape}')
+            print(f'class ratio (downsampled): target={count[0]}, non-target={count[1]}')
+    
+    # Make oversampling
+    if 'over' in mode:
+        oversamler = SMOTE()
+        X_over, y_over = oversamler.fit_resample(X, y)
+        data['over'] = {'x':X_over, 'y':y_over}
+        count = Counter(y_over)
+        if report:
+            print(f'x oversampled shape: {X_over.shape}\ny oversampled shape: {y_over.shape}')
+            print(f'class ratio (oversampled): target={count[0]}, non-target={count[1]}')
+    
+    # Oversampling of minor class and undersampling of major class
+    if 'balanced' in mode:
+        over = SMOTE(sampling_strategy=0.5)
+        under = RandomUnderSampler(sampling_strategy=0.5)
+        pipe = ImbPipeline(steps=[('over', over), ('under', under)])
+        X_balanced, y_balanced = pipe.fit_resample(X,y)
+        data['balanced'] = {'x':X_balanced, 'y':y_balanced}
+        count = Counter(y_balanced)
+        if report:
+            print(f'x balanced shape: {X_balanced.shape}\ny balanced shape: {y_balanced.shape}')
+            print(f'class ratio (balanced): target={count[0]}, non-target={count[1]}')
+    
+    return data
