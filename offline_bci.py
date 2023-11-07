@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
+import torch
 import matplotlib.pyplot as plt
 from random import choice
 from itertools import product
@@ -31,7 +32,7 @@ class OfflineBCI():
         self.info = test_set.info.copy()
         self.info.reset_index(inplace=True, names='prev_index')
         self.model = model
-        self.model_type = model_type
+        self.model_type = model_type 
         
         self.groups = GROUP1+GROUP2 # Groups of stimuli on the screen; contain symbol indecies in self.stims
         self.stims = [item for item in u'qwertyuiopasdfghjklzxcvbnm_1234567890!?.,;:"()+=-~[]\/']
@@ -54,15 +55,14 @@ class OfflineBCI():
     def average(self, data:dict):
         '''Average epochs for similar groups of stimuli'''
         
-        if isinstance(self.dataset.data[0][0], str):
-            for k, v in data.items():
-                data[k] = [np.load(f) for f in v] # load data for EEGDatasetAdvanced
-        
         x = []        
         for k, v in data.items():
-            x.append(np.average(v, axis=0))
+            if len(v)==1:
+                x.append(v[0])
+            else:
+                x.append(np.average(v, axis=0))
         
-        return flatten(np.stack(x))
+        return np.stack(x)
     
     def get_timing(self, cycles:int):
         '''
@@ -79,10 +79,11 @@ class OfflineBCI():
         
         # Make predictions
         if self.model_type=='ML':
-            out = self.model.predict(X)
+            out = self.model.predict(flatten(X))
         else:
             self.model.eval()
-            out = self.model(X)
+            X = torch.tensor(X)
+            out = self.model(X).detach().numpy().reshape(18)
         
         # Find target predicions
         ser = pd.Series(out)
@@ -173,7 +174,7 @@ class OfflineBCI():
         # Get epochs for each group of stimuli
         data = dict([k, []] for k in range(18))
         for idx, gr in info.iterrows():            
-            data[gr.code].append(self.dataset.data[idx])
+            data[gr.code].append(self.dataset[idx][0])
         # Average across each gropup
         X = self.average(data)
         gr1, gr2 = self.choose_groups(X)

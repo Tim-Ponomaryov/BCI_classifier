@@ -159,7 +159,7 @@ class EEGDatasetAdvanced(Dataset):
         transform -- ...
         
         **kwargs:
-        downsampling -- int that means the downsampling factor when creating a new cache
+        downsampe -- int that means the downsampling factor when creating a new cache
         dtype -- numpy.dtype like np.float16 to convert data when creating a new cache
         
         '''
