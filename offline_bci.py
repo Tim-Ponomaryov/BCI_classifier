@@ -17,7 +17,7 @@ GROUP2 = [(0, 17, 24), (1, 9, 25), (2, 10, 26),
 
 class OfflineBCI():
     
-    def __init__(self, test_set, model, model_type='ML', use_heuristic=False):
+    def __init__(self, test_set, model, model_type='ML', use_heuristic=True):
         '''
         Class for offline BCI performance estimation
         
@@ -174,7 +174,7 @@ class OfflineBCI():
         # Get epochs for each group of stimuli
         data = dict([k, []] for k in range(18))
         for idx, gr in info.iterrows():            
-            data[gr.code].append(self.dataset[idx][0])
+            data[gr.code].append(np.array(self.dataset[idx][0]))
         # Average across each gropup
         X = self.average(data)
         gr1, gr2 = self.choose_groups(X)
@@ -219,8 +219,8 @@ class OfflineBCI():
         
         for info in info_by_letter:
             letter = info.target_letter.values[0] # target letter in the current run
-            trial_id = np.arange(len(info)+1)[::18*n][1:-1] # ids to separate epochs info by trials -- multiple of 18 epochs
-            splidx = np.split(info.index.values, trial_id) # ids split info into trials (batch) info
+            trial_id = np.arange(len(info)+1)[::18*n] # ids to separate epochs info by trials -- multiple of 18 epochs
+            splidx = np.split(info.index.values, trial_id)[1:-1] # ids split info into trials (batch) info
             trial_info = [info.loc[i] for i in splidx] # list of info for each trial
             for ti in trial_info:
                 guess = self.process_trial(ti)
@@ -242,7 +242,7 @@ class OfflineBCI():
     
 from copy import deepcopy
 
-def split_by_words(dataset, n:int):
+def split_by_words(dataset, n_train:int):
     '''Split the dataset into 2 including specific number of words (5 letters)
     
     Arguments:
@@ -250,10 +250,10 @@ def split_by_words(dataset, n:int):
     
     '''
     
-    assert 0 < n < dataset.info.word_n.unique().max()+1, 'n must be 0 < n < n_words'
+    assert 0 < n_train < dataset.info.word_n.unique().max()+1, 'n must be 0 < n < n_words'
     
-    ids_train = dataset.info[dataset.info.word_n < n].index
-    ids_test = dataset.info[dataset.info.word_n >= n].index
+    ids_train = dataset.info[dataset.info.word_n < n_train].index
+    ids_test = dataset.info[dataset.info.word_n >= n_train].index
     
     if dataset.__class__.__name__ == 'EEGDataset':
         train_set = EEGDataset(root_dir=dataset.root_dir, 

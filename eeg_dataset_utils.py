@@ -148,7 +148,7 @@ class EEGDatasetAdvanced(Dataset):
     '''Advanced dataset to operate with wider amount of EEG data'''
     
     def __init__(self, root_dir:str=None, cache=True, load_cache=False, cache_dir_name:str='eeg_cache',
-                 subjects:list=[], transform=None, **kwargs):
+                 subjects:list=[], transform=None, n_average:int=None, **kwargs):
         '''
         Keyword arguments:
         root_dir -- a directory with .npy files that contain epochs
@@ -157,6 +157,7 @@ class EEGDatasetAdvanced(Dataset):
         cache_dir_name -- name of directory for cache to save it to or load it from
         subjects -- names of subjects to load their data
         transform -- ...
+        average -- int of how many epochs should average
         
         **kwargs:
         downsampe -- int that means the downsampling factor when creating a new cache
@@ -173,6 +174,8 @@ class EEGDatasetAdvanced(Dataset):
         self.subjects = subjects
         self.transform = transform
         
+        self.n_average=n_average
+        
         self.labels_info = {0:'target', 1:'non-target'}
         
         self.get_subjects() # list of available subjects
@@ -180,6 +183,8 @@ class EEGDatasetAdvanced(Dataset):
         self.load_data(**kwargs) # load data
         if self.subjects != []:
             self.pick_subjects(self.subjects)
+        if self.n_average:
+            self.average(n_average)
         self.get_info()
         
     def __len__(self):
@@ -188,8 +193,11 @@ class EEGDatasetAdvanced(Dataset):
     
     def __getitem__(self, idx):
         
-        x = torch.tensor(np.load(os.path.join(self.cache_path, self.data[idx])), dtype=torch.float32)
-        y = torch.tensor(int(self.data[idx].split('_')[-2]), dtype=torch.float32)
+        if self.n_average:
+            x, y = self._average(idx)
+        else:
+            x = torch.tensor(np.load(os.path.join(self.cache_path, self.data[idx])), dtype=torch.float32)
+            y = torch.tensor(int(self.data[idx].split('_')[-2]), dtype=torch.float32)
         
         if self.mask: # Choose channels if needed
             x = x[self.mask, :]
@@ -198,11 +206,40 @@ class EEGDatasetAdvanced(Dataset):
             x = self.transform(x)
         
         return x, y
+    
+    def average(self, n):
+        '''Do averaging'''
+        if self.n_average:
+            self.load_data()
+            self.pick_subjects(self.subjects)
+        self.n_average = n
+        self.average_list()
+    
+    def _average(self, idx):
+        '''Average epochs'''
+        
+        y = torch.tensor(int(self.data[idx][0].split('_')[-2]), dtype=torch.float32)
+        files = [os.path.join(self.cache_path, f) for f in self.data[idx]]
+        x = np.average([np.load(f) for f in files], axis=0)
+        x = torch.tensor(x, dtype=torch.float32)
+        
+        return x, y
+    
+    def average_list(self):
+        '''Adjust data property to be able to average epochs'''
+        
+        data = self.data.copy()
+        target = list(filter(lambda x: int(x.split('_')[-2])==0, data))
+        nontarget = list(filter(lambda x: int(x.split('_')[-2])==1, data))
+        data = []
+        for lst in (target, nontarget):
+            data += list(self.grouped(lst, self.n_average))
+        
+        self.data = data
         
     def load_data(self, **kwargs):
         
         if self.cache:
-            
             if not os.path.exists(self.cache_path):
                 os.makedirs(self.cache_path)
             if self.load_cache:
@@ -245,6 +282,9 @@ class EEGDatasetAdvanced(Dataset):
             self.subjects = self.available_subjects.copy()
     
     def get_info(self):
+        
+        if self.n_average:
+            return
         
         info_list = []
         for subject in self.subjects:
@@ -296,7 +336,13 @@ class EEGDatasetAdvanced(Dataset):
         self.subjects = subjects
         self.subjects.sort()
         self.data.sort(key=lambda x: (x.split('_')[0], int(x.split('_')[2])))
-        self.get_info()
+        if not self.n_average:
+            self.get_info()
+    
+    @staticmethod    
+    def grouped(iterable, n):
+        '''Make chunks of n consecutive elements in iterable'''
+        return zip(*[iter(iterable)]*n)
 
 class Normalize(nn.Module):
     '''Normalization for non-image data
