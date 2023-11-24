@@ -7,18 +7,8 @@ from random import shuffle
 
 import torch
 from torch.utils.data import Dataset
-# from torch.utils.data import DataLoader
 from torch import nn as nn 
 import torchvision.transforms.functional as F
-# from torchvision.transforms import Compose
-
-# from sklearn.model_selection import StratifiedKFold
-# from sklearn.model_selection import train_test_split
-# from sklearn.preprocessing import RobustScaler
-# from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
-# from sklearn.svm import SVC, LinearSVC
-# from sklearn.metrics import balanced_accuracy_score, f1_score, accuracy_score
-# from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_validate
 
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
@@ -28,15 +18,17 @@ class EEGDataset(Dataset):
     '''Simple dataset for P300 eeg data for one subject'''
     
     def __init__(self, root_dir:str=None, subject:str=None, data:np.ndarray=None, labels:np.ndarray=None,
-                 info:pd.DataFrame=None, transform=None, pick_channels=None):
+                 info:pd.DataFrame=None, transform=None, channels=[], average=None, downsample=None):
         
         super().__init__()
         
         self.root_dir = root_dir
         self.subject = subject
         # self._subjects() # list of all subject codes
-        self._channels() # list of channels
+        self.ch_names = self._channels() # list of channels
+        self.transform = transform
         
+        # Constructor from arrays
         if isinstance(data, np.ndarray) and isinstance(labels, np.ndarray):
             self.data = data
             self.x = data.copy()
@@ -44,16 +36,18 @@ class EEGDataset(Dataset):
             self.y = labels.copy()
             self.info = info
         else:
+            # Constructor from files
             self.load_data()
-            
+        
+        # Labels decoding    
         self.labels_info = {0:'target', 1:'non-target'}
         
-        self.transform = transform
+        # Data augmentations
+        self.downsampling_coef = downsample
+        self.n_average = average
+        self.pick_channels(channels)
         
-        self.mask = None
-        self.picked = None
-        if pick_channels:
-            self.pick_channels(pick_channels)
+        self._adjust_data()
         
     def __len__(self):
         
@@ -86,17 +80,26 @@ class EEGDataset(Dataset):
         
         '''
         
-        from ast import literal_eval
-        with open(os.path.join(self.root_dir, 'eeg_ch_names.txt'), 'r') as f:
-            self.ch_names = literal_eval(f.readline())
-    
+        # from ast import literal_eval
+        # with open(os.path.join(self.root_dir, 'eeg_ch_names.txt'), 'r') as f:
+        #     ch_names = literal_eval(f.readline())
+        
+        ch_names = ['F7', 'F5', 'F3', 'F1', 'Fz', 'F2', 'F4', 'F6', 'F8',
+                         'FC5', 'FC3', 'FC1', 'FCz', 'FC2', 'FC4', 'FC6',
+                         'C5', 'C3', 'C1', 'Cz', 'C2', 'C4', 'C6',
+                         'CP5', 'CP3', 'CP1', 'CPz', 'CP2', 'CP4', 'CP6',
+                         'P7', 'P5', 'P3', 'P1', 'Pz', 'P2', 'P4', 'P6', 'P8',
+                         'PO3', 'POz', 'PO4', 'O1', 'O2']
+        
+        return ch_names
+            
     def _subjects(self):
         '''Get list of subjects of the data'''
         
         files = os.listdir(self.root_dir)
         files = list(filter(lambda x: x.endswith('.npy'), files))
-        self.subjects = list(set(map(lambda x:x.split('_')[0], files)))
-        self.subjects.sort()
+        self.available_subjects = list(set(map(lambda x:x.split('_')[0], files)))
+        self.available_subjects.sort()
                 
     def pick_channels(self, channels:list=[]):
         '''Pick some eeg channels according to list of electordes
@@ -107,33 +110,67 @@ class EEGDataset(Dataset):
         assert isinstance(channels, list), 'Channels must be given as list'
         
         if channels==[]:
-            
+            self.picked = self.ch_names.copy()
             self.mask=None
-            return
+        else:
+            self.picked = channels
+            self.mask = [self.ch_names.index(ch) for ch in channels]
+            self.mask.sort()
+        self._adjust_data()
+    
+    def _pick_channels(self):
+        '''Pick eeg channels'''
         
-        self.picked = channels
-        self.mask = [self.ch_names.index(ch) for ch in channels]
-        self.x = self.data[:,self.mask,:].copy()
+        if self.mask:
+            self.x = self.x[:,self.mask,:]
     
     def average(self, n:int):
         '''Calculate average of n channels for all epochs'''
         
-        x_t = self.data[self.labels==0].copy()
-        x_nt = self.data[self.labels==1].copy()
-        x_t_ave = self._average(x_t, n)
-        x_nt_ave = self._average(x_nt, n)
+        self.n_average = n
+        self._adjust_data()
+        
+    def _average(self):
+        '''Calculate average of n channels for all epochs'''
+        
+        x_t = self.x[self.y==0].copy()
+        x_nt = self.x[self.y==1].copy()
+        x_t_ave = self._average_one(x_t, self.n_average)
+        x_nt_ave = self._average_one(x_nt, self.n_average)
         self.x = np.vstack([x_t_ave, x_nt_ave])
         self.y = np.hstack([np.zeros(x_t_ave.shape[0]), np.ones(x_nt_ave.shape[0])])
-        if self.mask:
-            self.x = self.x[:,self.mask,:]
         
-    def _average(self, x, n:int):
+    def _average_one(self, x, n:int):
         '''Calculate average for n suиsequent samples in x'''
         
         x_dev = [x[n-i::n] for i in range(1,n+1)]
         min_shape = min([ar.shape for ar in x_dev])
         x_dev = [arr[1:]  if (arr.shape > min_shape) else arr for arr in x_dev]
         return np.mean(np.array(x_dev), axis=0)
+    
+    def downsample(self, n:int):
+        '''Make downsampling on data'''
+        
+        self.downsampling_coef = n
+        self._adjust_data()
+    
+    def _downsample(self):
+        '''Make downsampling on data'''
+        
+        self.x = self.x[:,:,::self.downsampling_coef]
+    
+    def _adjust_data(self):
+        '''Do changes on data'''
+        
+        self.x = self.data.copy()
+        self.y = self.labels.copy()
+        
+        if self.downsampling_coef:
+            self._downsample()
+        if self.mask:
+            self._pick_channels()
+        if self.n_average:
+            self._average()
 
 def merge_datasets(*datasets) -> EEGDataset: 
     '''Merge eeg datasets in one'''
@@ -147,17 +184,19 @@ def merge_datasets(*datasets) -> EEGDataset:
 class EEGDatasetAdvanced(Dataset): 
     '''Advanced dataset to operate with wider amount of EEG data'''
     
-    def __init__(self, root_dir:str=None, cache=True, load_cache=False, cache_dir_name:str='eeg_cache',
-                 subjects:list=[], transform=None, n_average:int=None, **kwargs):
+    def __init__(self, root_dir:str=None, load_cache=True, discret=35, cache_dir_name:str='eeg_cache',
+                 subjects:list=[], transform=None, n_average:int=None, reverse_labels=False, **kwargs):
         '''
         Keyword arguments:
         root_dir -- a directory with .npy files that contain epochs
-        cache -- flag whether need to cache files or keep in memory NOTE: can be only True now
         load_cache -- flag to load existing cache instead making new one
+        discret -- cache discretization
         cache_dir_name -- name of directory for cache to save it to or load it from
         subjects -- names of subjects to load their data
         transform -- ...
         average -- int of how many epochs should average
+        reverse_labels -- bool means whether to swipe class names (t:0, nt:1) -> (t:1, nt:0)
+                          for better confusion matrix development
         
         **kwargs:
         downsampe -- int that means the downsampling factor when creating a new cache
@@ -169,13 +208,14 @@ class EEGDatasetAdvanced(Dataset):
         
         self.root_dir = root_dir
         self.cache_path = os.path.join(self.root_dir, cache_dir_name)
-        self.cache = cache
         self.load_cache = load_cache
         self.subjects = subjects
         self.transform = transform
+        self.discret = discret
         
         self.n_average=n_average
         
+        self.reverse_labels=reverse_labels
         self.labels_info = {0:'target', 1:'non-target'}
         
         self.get_subjects() # list of available subjects
@@ -204,6 +244,9 @@ class EEGDatasetAdvanced(Dataset):
         
         if self.transform:
             x = self.transform(x)
+        
+        if self.reverse_labels:
+            y = np.abs(y-1)
         
         return x, y
     
@@ -239,18 +282,14 @@ class EEGDatasetAdvanced(Dataset):
         
     def load_data(self, **kwargs):
         
-        if self.cache:
-            if not os.path.exists(self.cache_path):
-                os.makedirs(self.cache_path)
-            if self.load_cache:
-                # print('Cache is already available')
-                self.data = os.listdir(self.cache_path)
-                self.data.sort(key=lambda x: (x.split('_')[0], int(x.split('_')[2])))
-                return
-            self._load_and_cache(**kwargs)
-        else:
-            raise Exception('This option is not available yet')
-            self._load_in_memory()    
+        if not os.path.exists(self.cache_path):
+            os.makedirs(self.cache_path)
+        if self.load_cache:
+            # print('Cache is already available')
+            self.data = os.listdir(self.cache_path)
+            self.data.sort(key=lambda x: (x.split('_')[0], int(x.split('_')[2])))
+            return
+        self._load_and_cache(**kwargs)
                 
     def _load_and_cache(self, downsample=1, dtype=np.float64, **kwargs):
         '''cycle across all subjects to save each epoch separately'''
@@ -264,12 +303,6 @@ class EEGDatasetAdvanced(Dataset):
                 np.save(os.path.join(self.cache_path, f'{name}_epoch_{i}_class_{labels[i]}_.npy'), data[i])
         print(f'All data is cached in {self.cache_path}')
         self.data = os.listdir(self.cache_path)
-        
-    def _load_in_memory(self):
-        '''make a list of epochs'''
-        # TODO
-        # I don`t think we need this option in the dataset...
-        print('This option is not available yet')
     
     def get_subjects(self):
         '''Get list of subjects of the data'''
@@ -488,7 +521,7 @@ class One_vs_all():
 from collections import Counter
     
 def sampling(dataset:EEGDataset=None, X:np.ndarray=None, y:np.ndarray=None,
-             report=False, mode:list=None):
+             report=False, mode:list=None, random_state=42):
     '''
     
     mode -- 'real', 'over', 'under', 'balanced'
@@ -525,7 +558,7 @@ def sampling(dataset:EEGDataset=None, X:np.ndarray=None, y:np.ndarray=None,
     
     # Make oversampling
     if 'over' in mode:
-        oversamler = SMOTE()
+        oversamler = SMOTE(random_state=random_state)
         X_over, y_over = oversamler.fit_resample(X, y)
         data['over'] = {'x':X_over, 'y':y_over}
         count = Counter(y_over)
@@ -535,8 +568,8 @@ def sampling(dataset:EEGDataset=None, X:np.ndarray=None, y:np.ndarray=None,
     
     # Oversampling of minor class and undersampling of major class
     if 'balanced' in mode:
-        over = SMOTE(sampling_strategy=0.5)
-        under = RandomUnderSampler(sampling_strategy=0.5)
+        over = SMOTE(sampling_strategy=0.5, random_state=random_state)
+        under = RandomUnderSampler(sampling_strategy=0.5, random_state=random_state)
         pipe = ImbPipeline(steps=[('over', over), ('under', under)])
         X_balanced, y_balanced = pipe.fit_resample(X,y)
         data['balanced'] = {'x':X_balanced, 'y':y_balanced}

@@ -4,6 +4,7 @@ import os
 import torch
 import matplotlib.pyplot as plt
 from random import choice
+import random
 from itertools import product
 
 from eeg_dataset_utils import EEGDataset, EEGDatasetAdvanced, flatten
@@ -87,7 +88,8 @@ class OfflineBCI():
         
         # Find target predicions
         ser = pd.Series(out)
-        group_ids = ser[ser<=0.5].index.to_list()
+        group_ids = ser[ser>=0.5].index.to_list() # Theshold depends on target class id (old->0, new->1???)
+
         
         # Devide predictions into groups according to given groups
         gr1_ids = list(filter(lambda x: x<9, group_ids.copy()))
@@ -115,6 +117,8 @@ class OfflineBCI():
     
     def heuristic(self, gr1_ids, gr2_ids):
         '''Try to find possible correct guesses from given'''
+        
+        random.seed(self.random_state)
         
         comb = list(product(gr1_ids, gr2_ids))
         possible = [] # Container to store possibly true answers
@@ -186,6 +190,28 @@ class OfflineBCI():
         
         return guess
     
+    def process_subject(self, subject_info, n):
+        '''Run processing pipeline for a single subject'''
+        
+        ids = np.where(subject_info.target_letter[:-1].values != subject_info.target_letter[1:].values)[0] + 1
+        idx = subject_info.index.values # epochs indicies
+        splidx = np.split(idx, ids) # list of indicies corresponding to each target letter
+        info_by_letter = [subject_info.loc[i] for i in splidx] # splitted version of info corresponding each target letter
+        
+        for info in info_by_letter:
+            letter = info.target_letter.values[0] # target letter in the current run
+            trial_id = np.arange(len(info)+1)[::18*n] # ids to separate epochs info by trials -- multiple of 18 epochs
+            splidx = np.split(info.index.values, trial_id)[1:-1] # ids split info into trials (batch) info
+            trial_info = [info.loc[i] for i in splidx] # list of info for each trial
+            for ti in trial_info:
+                guess = self.process_trial(ti)
+                # check if the guess is correct
+                if guess == letter:
+                    self.result['correct_trials'] += 1
+                self.result['total_trials'] += 1
+                self.result['target_letter'].append(letter)
+                self.result['guess'].append(guess)
+    
     def summary(self):
         '''Print summary on classification'''
         
@@ -195,7 +221,7 @@ class OfflineBCI():
         print(f'Classification accuracy: {self.P:.2f}')
         
     
-    def pipeline(self, n, summary=False):
+    def pipeline(self, n, summary=False, random_state=42):
         '''
         Function to emulate BCI process.
         Needs to pass epochs in classifier, estimate score for
@@ -209,7 +235,7 @@ class OfflineBCI():
         P -- classification accuracy
         
         '''
-        
+        self.random_state = random_state
         self.get_timing(n)
         # indicies of the last letters in a row of similar letters
         ids = np.where(self.info.target_letter[:-1].values != self.info.target_letter[1:].values)[0] + 1
